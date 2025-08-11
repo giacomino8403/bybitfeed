@@ -157,4 +157,118 @@ def add_indicators(df):
 
 # ========= SANITIZATION =========
 def clean_val(v):
-    # Converte
+    # Converte NaN/Inf in None e arrotonda i float
+    if isinstance(v, float):
+        if math.isfinite(v):
+            return round(v, 6)
+        return None
+    if isinstance(v, (int, str, bool)):
+        return v
+    if pd.isna(v):
+        return None
+    return None
+
+# ========= SIGNAL ENGINE (robusto) =========
+def compute_signal(row):
+    # valori puliti/neutralizzati
+    ema20 = clean_val(row.get("EMA20"))
+    ema50 = clean_val(row.get("EMA50"))
+    ema200 = clean_val(row.get("EMA200"))
+    macd = clean_val(row.get("MACD"))
+    macd_signal = clean_val(row.get("MACDsig"))
+    rsi = clean_val(row.get("RSI"))
+    adx = clean_val(row.get("ADX"))
+    bb_up = clean_val(row.get("BB_up"))
+    bb_dn = clean_val(row.get("BB_dn"))
+    close = clean_val(row.get("close"))
+    vol_spike = bool(row.get("VOL_spike")) if not pd.isna(row.get("VOL_spike")) else False
+
+    score = 0
+
+    # Trend bias
+    if None not in (ema20, ema50, ema200):
+        if ema20 > ema50 > ema200:
+            score += 2
+        elif ema20 < ema50 < ema200:
+            score -= 2
+
+    # MACD
+    if None not in (macd, macd_signal):
+        score += 1 if macd > macd_signal else -1
+
+    # RSI zones
+    if rsi is not None:
+        if rsi < 30: score += 1
+        if rsi > 70: score -= 1
+
+    # ADX
+    if adx is not None and ema20 is not None and ema50 is not None:
+        if adx > 25:
+            score += 1 if ema20 > ema50 else -1
+
+    # Bollinger breakout
+    bb_breakout = 0
+    if None not in (bb_up, bb_dn, close):
+        if close > bb_up:
+            score += 1
+            bb_breakout = 1
+        if close < bb_dn:
+            score -= 1
+            bb_breakout = -1
+
+    # Volume spike
+    if vol_spike:
+        score += 1
+
+    # Segnale finale
+    if score >= 3: signal = "BUY"
+    elif score <= -3: signal = "SELL"
+    else: signal = "NEUTRAL"
+
+    ema_trend = None
+    if None not in (ema20, ema50, ema200):
+        ema_trend = "bull" if ema20 > ema50 > ema200 else \
+                    ("bear" if ema20 < ema50 < ema200 else "mix")
+
+    return score, signal, ema_trend, bb_breakout
+
+# ========= RUN =========
+def one_run():
+    ensure_header()
+    now_utc = datetime.now(timezone.utc)
+    now_it  = now_utc.astimezone(TZ_ITALY)
+
+    batch = []
+    for symbol in SYMBOLS:
+        for tf in TIMEFRAMES:
+            ex_id, sym_used, ohlcv = fetch_ohlcv_safe(symbol, tf, CANDLES)
+            if ohlcv is None:
+                continue  # salta ma continua
+
+            df  = to_df(ohlcv)
+            ind = add_indicators(df).iloc[-1]
+            ind = ind.fillna(value=pd.NA)
+
+            score, signal, ema_trend, bb_breakout = compute_signal(ind)
+
+            row = [
+                now_utc.isoformat(),
+                now_it.strftime("%Y-%m-%d %H:%M:%S"),
+                ex_id, symbol, sym_used, tf,
+                ind["close"], ind["EMA20"], ind["EMA50"], ind["EMA200"],
+                ind["RSI"], ind["STO_K"], ind["STO_D"],
+                ind["MACD"], ind["MACDsig"],
+                ind["ADX"], ind["ATR"], ind["BB_pos"], ind["VOL_spike"],
+                ema_trend, bb_breakout, score, signal
+            ]
+            batch.append([clean_val(v) for v in row])
+            print(f"{symbol} {tf} via {ex_id}: signal={signal} score={score}")
+
+    if batch:
+        ws.append_rows(batch, value_input_option="RAW")
+        print(f"Aggiornamento scritto su Google Sheets ✔️ ({len(batch)} righe)")
+    else:
+        log_issue("writer","nessuna riga scritta (tutte le combinazioni fallite)")
+
+if __name__ == "__main__":
+    one_run()
