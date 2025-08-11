@@ -1,39 +1,58 @@
-import os, time, json
+import os
+import time
 import pandas as pd
 import ccxt
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-# -------- Config da ENV --------
+# -------- Config da Secrets/Env --------
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-SHEET_NAME = os.getenv("SHEET_NAME", "Foglio1")  # cambia se serve
-TZ = timezone(timedelta(hours=2))  # Europa/Roma (CEST). In inverno metti +1.
+SHEET_NAME     = os.getenv("SHEET_NAME", "Foglio1")  # cambia se necessario
 
-SYMBOLS = ["ETH/USDT", "XRP/USDT"]
+SYMBOLS    = ["ETH/USDT", "XRP/USDT"]
 TIMEFRAMES = ["15m", "1h"]
-CANDLES = 200
+CANDLES    = 200
 
-# -------- Google Sheets auth (creds.json da secret) --------
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-# Il workflow crea creds.json prima di eseguire
+TZ_ITALY = ZoneInfo("Europe/Rome")
+
+# -------- Google Sheets auth (il workflow crea creds.json da secret) --------
+scope = ["https://spreadsheets.google.com/feeds",
+         "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name("creds.json", scope)
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(SPREADSHEET_ID)
 ws = sh.worksheet(SHEET_NAME)
 
-def connect(exchange_id):
-    ex = getattr(ccxt, exchange_id)(
-        {"enableRateLimit": True, "options": {"defaultType": "spot"}}
-    )
-    ex.load_markets()
-    return ex
+def connect_exchange(name: str):
+    """Istanzia l'exchange e prova a load_markets(). Se fallisce, ritorna None."""
+    try:
+        ex = getattr(ccxt, name)({
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"}  # SPOT per evitare blocchi derivati
+        })
+        ex.load_markets()
+        print(f"{name} pronto.")
+        return ex
+    except Exception as e:
+        print(f"{name} non disponibile: {e}")
+        return None
 
-bybit = connect("bybit")
-binance = connect("binance")
-EXCHS = [bybit, binance]
+# Prova Bybit, fallback a Binance se necessario
+EXCHS = []
+bybit = connect_exchange("bybit")
+if bybit:
+    EXCHS.append(bybit)
+binance = connect_exchange("binance")
+if binance and binance not in EXCHS:
+    EXCHS.append(binance)
+
+if not EXCHS:
+    raise RuntimeError("Nessun exchange disponibile (bybit/binance).")
 
 def fetch_ohlcv_safe(symbol, timeframe, limit):
+    """Tenta gli exchange in EXCHS in ordine; alla prima risposta valida ritorna (ex_id, data)."""
     last_err = None
     for ex in EXCHS:
         try:
@@ -42,9 +61,9 @@ def fetch_ohlcv_safe(symbol, timeframe, limit):
                 return ex.id, data
         except Exception as e:
             last_err = e
-            print(f"[{ex.id}] fallback {symbol} {timeframe}: {e}")
+            print(f"[{ex.id}] errore su {symbol} {timeframe}, provo il prossimo: {e}")
             time.sleep(0.6)
-    raise RuntimeError(f"Nessun exchange disponibile per {symbol} {timeframe}. Ultimo errore: {last_err}")
+    raise RuntimeError(f"Nessun exchange ha risposto per {symbol} {timeframe}. Ultimo errore: {last_err}")
 
 def to_df(data):
     df = pd.DataFrame(data, columns=["ts","open","high","low","close","volume"])
@@ -64,20 +83,22 @@ def add_indicators(df):
     return out
 
 def ensure_header():
-    vals = ws.get_all_values()
-    if len(vals) == 0:
-        header = [["timestamp_utc","timestamp_it","exchange","symbol","timeframe",
-                   "close","ema20","ema50","ema200","rsi","macd","macd_signal"]]
+    if len(ws.get_all_values()) == 0:
+        header = [[
+            "timestamp_utc","timestamp_italy","exchange","symbol","timeframe",
+            "close","ema20","ema50","ema200","rsi","macd","macd_signal"
+        ]]
         ws.append_rows(header)
 
 def one_run():
     rows = []
-    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
-    now_it  = now_utc.astimezone(TZ)
+    now_utc = datetime.now(timezone.utc)
+    now_it  = now_utc.astimezone(TZ_ITALY)
+
     for symbol in SYMBOLS:
         for tf in TIMEFRAMES:
             ex_id, ohlcv = fetch_ohlcv_safe(symbol, tf, CANDLES)
-            df = add_indicators(to_df(ohlcv))
+            df  = add_indicators(to_df(ohlcv))
             last = df.iloc[-1]
             rows.append([
                 now_utc.isoformat(),
@@ -92,6 +113,7 @@ def one_run():
                 float(last["MACD_signal"]),
             ])
             print(f"OK {symbol} {tf} via {ex_id}: close={last['close']:.6f} RSI={last['RSI']:.2f}")
+
     ensure_header()
     ws.append_rows(rows)
     print("Dati aggiunti su Google Sheets ✔️")
