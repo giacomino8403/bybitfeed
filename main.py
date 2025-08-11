@@ -11,7 +11,6 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 SHEET_NAME     = os.getenv("SHEET_NAME", "Foglio1")
 STATUS_SHEET   = os.getenv("STATUS_SHEET", "Status")
 
-# core + high/mid cap (puoi modificare)
 SYMBOLS = [
     "BTC/USDT","ETH/USDT","BNB/USDT","SOL/USDT","XRP/USDT",
     "ADA/USDT","DOGE/USDT","MATIC/USDT","LINK/USDT",
@@ -20,9 +19,8 @@ SYMBOLS = [
 TIMEFRAMES = ["15m","1h","4h","1d"]
 CANDLES    = 300
 
-# Su GitHub lasciamo solo "kraken". Su PC/Colab puoi fare EXCH_ENABLE="kraken,binance,bybit"
+# Su GitHub lascia “kraken”. Su PC/Colab puoi fare EXCH_ENABLE="kraken,binance,bybit"
 EXCH_ENABLE = os.getenv("EXCH_ENABLE", "kraken")
-
 TZ_ITALY = ZoneInfo("Europe/Rome")
 
 # ========= GOOGLE SHEETS =========
@@ -62,7 +60,6 @@ def log_issue(component: str, msg: str):
     try:
         status_ws.append_row([now, component, msg])
     except Exception as e:
-        # Se anche il log fallisce, almeno stampiamo
         print(f"[WARN] status append failed: {e}")
 
 # ========= EXCHANGES =========
@@ -158,91 +155,6 @@ def add_indicators(df):
 
     return out
 
-def compute_signal(row):
-    score = 0
-
-    # Trend bias
-    if row["EMA20"] > row["EMA50"] > row["EMA200"]: score += 2
-    elif row["EMA20"] < row["EMA50"] < row["EMA200"]: score -= 2
-
-    # MACD
-    score += 1 if row["MACD"] > row["MACDsig"] else -1
-
-    # RSI zones
-    if row["RSI"] < 30: score += 1
-    if row["RSI"] > 70: score -= 1
-
-    # ADX (forza trend)
-    if row["ADX"] > 25:
-        score += 1 if row["EMA20"] > row["EMA50"] else -1
-
-    # Bollinger breakout
-    bb_breakout = 0
-    if row["close"] > row["BB_up"]:  score += 1; bb_breakout = 1
-    if row["close"] < row["BB_dn"]:  score -= 1; bb_breakout = -1
-
-    # Volume spike
-    if bool(row["VOL_spike"]): score += 1
-
-    # Segnale finale
-    if score >= 3: signal = "BUY"
-    elif score <= -3: signal = "SELL"
-    else: signal = "NEUTRAL"
-
-    ema_trend = "bull" if row["EMA20"] > row["EMA50"] > row["EMA200"] else \
-                ("bear" if row["EMA20"] < row["EMA50"] < row["EMA200"] else "mix")
-    return score, signal, ema_trend, bb_breakout
-
 # ========= SANITIZATION =========
 def clean_val(v):
-    # Converte NaN/Inf in None e arrotonda i float
-    if isinstance(v, float):
-        if math.isfinite(v):
-            return round(v, 6)
-        return None
-    if isinstance(v, (int, str, bool)):
-        return v
-    if pd.isna(v):
-        return None
-    return None
-
-# ========= RUN =========
-def one_run():
-    ensure_header()
-    now_utc = datetime.now(timezone.utc)
-    now_it  = now_utc.astimezone(TZ_ITALY)
-
-    batch = []
-    for symbol in SYMBOLS:
-        for tf in TIMEFRAMES:
-            ex_id, sym_used, ohlcv = fetch_ohlcv_safe(symbol, tf, CANDLES)
-            if ohlcv is None:
-                continue  # salta ma continua
-
-            df  = to_df(ohlcv)
-            ind = add_indicators(df).iloc[-1]
-            ind = ind.fillna(value=pd.NA)
-
-            score, signal, ema_trend, bb_breakout = compute_signal(ind)
-
-            row = [
-                now_utc.isoformat(),
-                now_it.strftime("%Y-%m-%d %H:%M:%S"),
-                ex_id, symbol, sym_used, tf,
-                ind["close"], ind["EMA20"], ind["EMA50"], ind["EMA200"],
-                ind["RSI"], ind["STO_K"], ind["STO_D"],
-                ind["MACD"], ind["MACDsig"],
-                ind["ADX"], ind["ATR"], ind["BB_pos"], ind["VOL_spike"],
-                ema_trend, bb_breakout, score, signal
-            ]
-            batch.append([clean_val(v) for v in row])
-            print(f"{symbol} {tf} via {ex_id}: signal={signal} score={score}")
-
-    if batch:
-        ws.append_rows(batch, value_input_option="RAW")
-        print(f"Aggiornamento scritto su Google Sheets ✔️ ({len(batch)} righe)")
-    else:
-        log_issue("writer","nessuna riga scritta (tutte le combinazioni fallite)")
-
-if __name__ == "__main__":
-    one_run()
+    # Converte
