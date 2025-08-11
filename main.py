@@ -7,9 +7,8 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-# -------- Config da Secrets/Env --------
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-SHEET_NAME     = os.getenv("SHEET_NAME", "Foglio1")  # cambia se necessario
+SHEET_NAME     = os.getenv("SHEET_NAME", "Foglio1")
 
 SYMBOLS    = ["ETH/USDT", "XRP/USDT"]
 TIMEFRAMES = ["15m", "1h"]
@@ -17,20 +16,18 @@ CANDLES    = 200
 
 TZ_ITALY = ZoneInfo("Europe/Rome")
 
-# -------- Google Sheets auth (il workflow crea creds.json da secret) --------
-scope = ["https://spreadsheets.google.com/feeds",
-         "https://www.googleapis.com/auth/drive"]
+# ---- Google Sheets auth ----
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name("creds.json", scope)
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(SPREADSHEET_ID)
 ws = sh.worksheet(SHEET_NAME)
 
 def connect_exchange(name: str):
-    """Istanzia l'exchange e prova a load_markets(). Se fallisce, ritorna None."""
     try:
         ex = getattr(ccxt, name)({
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"}  # SPOT per evitare blocchi derivati
+            "options": {"defaultType": "spot"}
         })
         ex.load_markets()
         print(f"{name} pronto.")
@@ -39,29 +36,32 @@ def connect_exchange(name: str):
         print(f"{name} non disponibile: {e}")
         return None
 
-# Prova Bybit, fallback a Binance se necessario
+# Ordine di fallback: bybit -> binance -> kraken -> bitstamp
 EXCHS = []
-bybit = connect_exchange("bybit")
-if bybit:
-    EXCHS.append(bybit)
-binance = connect_exchange("binance")
-if binance and binance not in EXCHS:
-    EXCHS.append(binance)
+for name in ["bybit", "binance", "kraken", "bitstamp"]:
+    ex = connect_exchange(name)
+    if ex: EXCHS.append(ex)
 
 if not EXCHS:
-    raise RuntimeError("Nessun exchange disponibile (bybit/binance).")
+    raise RuntimeError("Nessun exchange disponibile (bybit/binance/kraken/bitstamp).")
 
 def fetch_ohlcv_safe(symbol, timeframe, limit):
-    """Tenta gli exchange in EXCHS in ordine; alla prima risposta valida ritorna (ex_id, data)."""
     last_err = None
     for ex in EXCHS:
         try:
-            data = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            if data:
-                return ex.id, data
+            # Alcuni exchange non hanno USDT ma USD: mappa se serve
+            sym = symbol
+            if ex.id in ("kraken", "bitstamp"):
+                # Kraken/Bitstamp spesso usano USD anziché USDT
+                base, quote = symbol.split("/")
+                if quote == "USDT":
+                    sym = f"{base}/USD" if f"{base}/USD" in ex.markets else symbol
+            data = ex.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
+            if data: 
+                return ex.id, data, sym
         except Exception as e:
             last_err = e
-            print(f"[{ex.id}] errore su {symbol} {timeframe}, provo il prossimo: {e}")
+            print(f"[{ex.id}] errore su {symbol}({sym}) {timeframe}, provo il prossimo: {e}")
             time.sleep(0.6)
     raise RuntimeError(f"Nessun exchange ha risposto per {symbol} {timeframe}. Ultimo errore: {last_err}")
 
@@ -85,7 +85,7 @@ def add_indicators(df):
 def ensure_header():
     if len(ws.get_all_values()) == 0:
         header = [[
-            "timestamp_utc","timestamp_italy","exchange","symbol","timeframe",
+            "timestamp_utc","timestamp_italy","exchange","symbol_used","symbol_requested","timeframe",
             "close","ema20","ema50","ema200","rsi","macd","macd_signal"
         ]]
         ws.append_rows(header)
@@ -97,13 +97,13 @@ def one_run():
 
     for symbol in SYMBOLS:
         for tf in TIMEFRAMES:
-            ex_id, ohlcv = fetch_ohlcv_safe(symbol, tf, CANDLES)
+            ex_id, ohlcv, sym_used = fetch_ohlcv_safe(symbol, tf, CANDLES)
             df  = add_indicators(to_df(ohlcv))
             last = df.iloc[-1]
             rows.append([
                 now_utc.isoformat(),
                 now_it.strftime("%Y-%m-%d %H:%M:%S"),
-                ex_id, symbol, tf,
+                ex_id, sym_used, symbol, tf,
                 float(last["close"]),
                 float(last["EMA20"]),
                 float(last["EMA50"]),
@@ -112,7 +112,7 @@ def one_run():
                 float(last["MACD"]),
                 float(last["MACD_signal"]),
             ])
-            print(f"OK {symbol} {tf} via {ex_id}: close={last['close']:.6f} RSI={last['RSI']:.2f}")
+            print(f"OK {symbol} ({sym_used}) {tf} via {ex_id}: close={last['close']:.6f} RSI={last['RSI']:.2f}")
 
     ensure_header()
     ws.append_rows(rows)
