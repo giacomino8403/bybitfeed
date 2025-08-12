@@ -1,0 +1,40 @@
+name: Build snapshot & changes
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install pandas
+
+      - name: Build snapshot from CSV
+        env:
+          CSV_URL: ${{ secrets.CSV_URL }}
+        run: python scripts/snapshot.py
+
+      - name: Commit & push if changed
+        run: |
+          if git diff --quiet docs/; then
+            echo "No changes in docs/*"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add docs/snapshot.json docs/changes.json docs/.nojekyll
+            git commit -m "Update snapshot & changes [skip ci]"
+            git push
+          fi
