@@ -1,12 +1,15 @@
-name: Feed to Google Sheets
+name: Build snapshot & changes
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # ogni 15 minuti
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write  # necessario per commit & push
+
 jobs:
-  monitor:
+  snapshot:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,17 +20,45 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install -r requirements.txt
+        run: pip install pandas requests
 
-      - name: Restore creds.json from secret
-        shell: bash
+      - name: Build snapshot from CSV
+        env:
+          CSV_URL: ${{ secrets.CSV_URL }}
+        run: python scripts/snapshot.py
+
+      - name: Commit & push if changed
         run: |
-          echo "$GOOGLE_CREDS_JSON_B64" | base64 -d > creds.json
-        env:
-          GOOGLE_CREDS_JSON_B64: ${{ secrets.GOOGLE_CREDS_JSON_B64 }}
+          if git diff --quiet docs/; then
+            echo "No changes in docs/*"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add docs/snapshot.json docs/changes.json
+            git commit -m "Update snapshot & changes [skip ci]"
+            git push
+          fi
 
-      - name: Run
+      # opzionale: invia alert Telegram se ci sono cambi
+      - name: Notify Telegram on changes
+        if: always()
         env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          SHEET_NAME: ${{ secrets.SHEET_NAME }}
-        run: python main.py
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            CHANGES=$(jq '.changes | length' docs/changes.json)
+            if [ "$CHANGES" -gt 0 ]; then
+              TEXT=$(jq -r '
+                .changes[0:10] | map("*\(.key)*: \(.type) | from: \(.from) -> to: \(.to)") | join("\n")
+              ' docs/changes.json)
+              MSG="🚨 *Crypto changes:* ${CHANGES} updates\n${TEXT}"
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                   -d chat_id="${TELEGRAM_CHAT_ID}" -d parse_mode=Markdown -d text="$MSG" >/dev/null
+              echo "Telegram alert sent."
+            else
+              echo "No changes; no alert."
+            fi
+          else
+            echo "Telegram secrets not set; skipping alert."
+          fi
